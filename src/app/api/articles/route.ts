@@ -1,0 +1,243 @@
+import { NextRequest } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { z } from "zod";
+import { sanitizeHtml } from "@/lib/sanitize";
+import {
+  successResponse,
+  errorResponse,
+  requireAuth,
+  logAudit,
+  ApiError,
+} from "@/lib/api-utils";
+import { slugify, calculateReadTime } from "@/lib/utils";
+import { canWriteArticles, canApproveArticles } from "@/lib/auth";
+
+const createArticleSchema = z.object({
+  title: z.string().min(5, "Judul minimal 5 karakter").max(255),
+  content: z.string().min(50, "Konten minimal 50 karakter"),
+  excerpt: z.string().max(500).optional(),
+  featuredImage: z.string().optional().nullable(),
+  categoryId: z.string().min(1, "Kategori wajib dipilih"),
+  tags: z.array(z.string()).optional(),
+  seoTitle: z.string().max(70).optional(),
+  seoDescription: z.string().max(160).optional(),
+  status: z.enum(["DRAFT", "IN_REVIEW"]).optional(),
+  authorId: z.string().optional(),
+  assignedEditorId: z.string().optional(),
+  sources: z
+    .array(
+      z.object({
+        name: z.string().min(1),
+        title: z.string().optional(),
+        institution: z.string().optional(),
+        url: z.string().optional(),
+      })
+    )
+    .optional(),
+  scheduledAt: z.string().datetime().optional().nullable(),
+});
+
+// GET /api/articles — list articles (public)
+export async function GET(request: NextRequest) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const page = parseInt(searchParams.get("page") || "1");
+    const limit = parseInt(searchParams.get("limit") || "12");
+    const category = searchParams.get("category");
+    const status = searchParams.get("status") || "PUBLISHED";
+    const authorId = searchParams.get("authorId");
+    const reviewedBy = searchParams.get("reviewedBy");
+    const sort = searchParams.get("sort") || "publishedAt";
+
+    const where: Record<string, unknown> = {};
+
+    if (status === "ALL") {
+      // Fetch all statuses — requires auth (admin panel)
+      const session = await requireAuth();
+      // Non-editor roles can only see their own articles
+      if (!canApproveArticles(session.user.role)) {
+        where.authorId = session.user.id;
+      }
+      // No status filter — return all
+    } else if (status === "PUBLISHED") {
+      where.status = "PUBLISHED";
+    } else {
+      // Non-public statuses require auth
+      const session = await requireAuth();
+      // Non-editor roles can only see their own articles
+      if (!canApproveArticles(session.user.role)) {
+        where.authorId = session.user.id;
+      }
+      where.status = status;
+    }
+
+    if (category) {
+      where.category = { slug: category };
+    }
+    if (authorId) {
+      where.authorId = authorId;
+    }
+    if (reviewedBy) {
+      where.reviewedBy = reviewedBy;
+    }
+
+    const orderBy: Record<string, string> =
+      sort === "views"
+        ? { viewCount: "desc" }
+        : sort === "oldest"
+          ? { publishedAt: "asc" }
+          : { publishedAt: "desc" };
+
+    const [articles, total] = await Promise.all([
+      prisma.article.findMany({
+        where,
+        include: {
+          author: { select: { id: true, name: true, avatar: true } },
+          category: { select: { id: true, name: true, slug: true } },
+          tags: { select: { id: true, name: true, slug: true } },
+        },
+        orderBy,
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.article.count({ where }),
+    ]);
+
+    // Resolve reviewer names for articles with reviewedBy
+    const reviewerIds = Array.from(new Set(articles.map(a => a.reviewedBy).filter(Boolean))) as string[];
+    let reviewerMap: Record<string, string> = {};
+    if (reviewerIds.length > 0) {
+      const reviewers = await prisma.user.findMany({
+        where: { id: { in: reviewerIds } },
+        select: { id: true, name: true },
+      });
+      reviewerMap = Object.fromEntries(reviewers.map(r => [r.id, r.name]));
+    }
+
+    const articlesWithReviewer = articles.map(a => ({
+      ...a,
+      reviewerName: a.reviewedBy ? reviewerMap[a.reviewedBy] || null : null,
+    }));
+
+    return successResponse({
+      articles: articlesWithReviewer,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
+
+// POST /api/articles — create article
+export async function POST(request: NextRequest) {
+  try {
+    const session = await requireAuth();
+
+    if (!canWriteArticles(session.user.role)) {
+      throw new ApiError("Tidak memiliki akses untuk membuat artikel", 403);
+    }
+
+    const body = await request.json();
+    const data = createArticleSchema.parse(body);
+
+    // Generate slug
+    let slug = slugify(data.title);
+    const existingSlug = await prisma.article.findUnique({ where: { slug } });
+    if (existingSlug) {
+      slug = `${slug}-${Date.now().toString(36)}`;
+    }
+
+    // Jurnalis/Senior Journalist can only create DRAFT or IN_REVIEW
+    const finalStatus = data.status || "DRAFT";
+
+    // Calculate read time
+    const readTime = calculateReadTime(data.content);
+
+    // Handle tags (batch to avoid N+1)
+    const tagConnections = [];
+    if (data.tags && data.tags.length > 0) {
+      const tagEntries = data.tags.map((name) => ({ name, slug: slugify(name) }));
+      await Promise.all(
+        tagEntries.map((t) =>
+          prisma.tag.upsert({
+            where: { slug: t.slug },
+            update: {},
+            create: { name: t.name, slug: t.slug },
+          })
+        )
+      );
+      const tags = await prisma.tag.findMany({
+        where: { slug: { in: tagEntries.map((t) => t.slug) } },
+        select: { id: true },
+      });
+      tagConnections.push(...tags.map((t) => ({ id: t.id })));
+    }
+
+    // Determine the actual author
+    const effectiveAuthorId = (canApproveArticles(session.user.role) && data.authorId) ? data.authorId : session.user.id;
+
+    // If submitting for review, assign an editor (use provided or random)
+    let assignedReviewerId: string | null = data.assignedEditorId || null;
+    if (finalStatus === "IN_REVIEW" && !assignedReviewerId) {
+      const editors = await prisma.user.findMany({
+        where: {
+          role: { in: ["EDITOR", "CHIEF_EDITOR"] },
+          isActive: true,
+        },
+        select: { id: true },
+      });
+      if (editors.length > 0) {
+        const randomIndex = Math.floor(Math.random() * editors.length);
+        assignedReviewerId = editors[randomIndex].id;
+      }
+    }
+
+    const article = await prisma.article.create({
+      data: {
+        title: data.title,
+        slug,
+        content: sanitizeHtml(data.content),
+        excerpt: data.excerpt || data.content.replace(/<[^>]*>/g, "").slice(0, 200),
+        featuredImage: data.featuredImage,
+        status: finalStatus as "DRAFT" | "IN_REVIEW",
+        verificationLabel: "UNVERIFIED",
+        readTime,
+        authorId: effectiveAuthorId,
+        categoryId: data.categoryId,
+        seoTitle: data.seoTitle || data.title,
+        seoDescription: data.seoDescription || data.content.replace(/<[^>]*>/g, "").slice(0, 160),
+        publishedAt: null,
+        scheduledAt: data.scheduledAt ? new Date(data.scheduledAt) : null,
+        tags: { connect: tagConnections },
+        sources: data.sources
+          ? { create: data.sources }
+          : undefined,
+        reviewedBy: assignedReviewerId,
+        assignedEditorId: data.assignedEditorId || null,
+      },
+      include: {
+        author: { select: { id: true, name: true } },
+        category: { select: { id: true, name: true, slug: true } },
+        tags: true,
+        sources: true,
+      },
+    });
+
+    await logAudit(
+      session.user.id,
+      "CREATE",
+      "article",
+      article.id,
+      `Membuat artikel: ${article.title} [status: ${finalStatus}]${assignedReviewerId ? ` [editor: ${assignedReviewerId}]` : ""}`
+    );
+
+    return successResponse(article, 201);
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
